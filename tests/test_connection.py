@@ -28,35 +28,57 @@ class TestConnectionMethods(unittest.TestCase):
     @defer.inlineCallbacks
     def test_Connection(self):
         db = yield redis.Connection(REDIS_HOST, REDIS_PORT, reconnect=False)
-        self.assertEqual(isinstance(db, redis.ConnectionHandler), True)
+        self.assertIsInstance(db, redis.ConnectionHandler)
         yield db.disconnect()
 
     @defer.inlineCallbacks
     def test_ConnectionDB1(self):
         db = yield redis.Connection(REDIS_HOST, REDIS_PORT, dbid=1,
                                     reconnect=False)
-        self.assertEqual(isinstance(db, redis.ConnectionHandler), True)
+        self.assertIsInstance(db, redis.ConnectionHandler)
         yield db.disconnect()
 
     @defer.inlineCallbacks
     def test_ConnectionPool(self):
         db = yield redis.ConnectionPool(REDIS_HOST, REDIS_PORT, poolsize=2,
                                         reconnect=False)
-        self.assertEqual(isinstance(db, redis.ConnectionHandler), True)
+        self.assertIsInstance(db, redis.ConnectionHandler)
+        yield db.disconnect()
+
+    @defer.inlineCallbacks
+    def test_lazyReconnectingConnection(self):
+        db = redis.lazyConnection(REDIS_HOST, REDIS_PORT, reconnect=True)
+        self.assertEqual(repr(db), '<Redis Connection: Not connected>')
+        yield db.ping()
+        self.assertNotEqual(repr(db), '<Redis Connection: Not connected>')
+        self.assertIsInstance(db, redis.ConnectionHandler)
+        yield db.disconnect()
+
+    @defer.inlineCallbacks
+    def test_lazyReconnectingConnectionPool(self):
+        db = redis.lazyConnectionPool(REDIS_HOST, REDIS_PORT, reconnect=True)
+        self.assertEqual(repr(db), '<Redis Connection: Not connected>')
+        yield db.ping()
+        self.assertNotEqual(repr(db), '<Redis Connection: Not connected>')
+        self.assertIsInstance(db, redis.ConnectionHandler)
         yield db.disconnect()
 
     @defer.inlineCallbacks
     def test_lazyConnection(self):
         db = redis.lazyConnection(REDIS_HOST, REDIS_PORT, reconnect=False)
-        self.assertEqual(isinstance(db._connected, defer.Deferred), True)
-        db = yield db._connected
-        self.assertEqual(isinstance(db, redis.ConnectionHandler), True)
+        self.assertEqual(repr(db), '<Redis Connection: Not connected>')
+        conn = yield db._factory.waitForConnection()
+        yield db.ping()
+        self.assertNotEqual(repr(db), '<Redis Connection: Not connected>')
+        self.assertIsInstance(db, redis.ConnectionHandler)
         yield db.disconnect()
 
     @defer.inlineCallbacks
     def test_lazyConnectionPool(self):
         db = redis.lazyConnectionPool(REDIS_HOST, REDIS_PORT, reconnect=False)
-        self.assertEqual(isinstance(db._connected, defer.Deferred), True)
-        db = yield db._connected
-        self.assertEqual(isinstance(db, redis.ConnectionHandler), True)
+        self.assertEqual(repr(db), '<Redis Connection: Not connected>')
+        conn = yield db._factory.waitForConnection()
+        yield db.ping()
+        self.assertNotEqual(repr(db), '<Redis Connection: Not connected>')
+        self.assertIsInstance(db, redis.ConnectionHandler)
         yield db.disconnect()

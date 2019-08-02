@@ -29,6 +29,8 @@ import warnings
 import string
 import hashlib
 import random
+import itertools
+import hiredis
 
 from twisted.internet import defer
 from twisted.internet import protocol
@@ -37,8 +39,6 @@ from twisted.protocols import basic
 from twisted.protocols import policies
 from twisted.python import log
 from twisted.python.failure import Failure
-
-import hiredis
 
 
 class RedisError(Exception):
@@ -1653,7 +1653,6 @@ class RedisProtocol(BaseRedisProtocol):
 class ConnectionHandler(object):
     def __init__(self, factory):
         self._factory = factory
-        self._connected = factory.deferred
 
     def GetStatus(self):
         return {
@@ -1734,16 +1733,22 @@ class PeekableQueue(defer.DeferredQueue):
     def remove(self, item):
         self.pending.remove(item)
 
-    def put_for_pending_peekers(self, obj):
+    def put(self, obj):
         peekers = self.peekers[:]
         self.peekers[:] = []
 
         for d in peekers:
             d.callback(obj)
 
-    def put(self, obj):
-        self.put_for_pending_peekers(obj)
         defer.DeferredQueue.put(self, obj)
+
+    def signal_error(self, err):
+        deferreds = list(itertools.chain(self.peekers, self.waiting))
+        self.peekers[:] = []
+        self.waiting[:] = []
+
+        for d in deferreds:
+            d.errback(err)
 
 
 class RedisFactory(protocol.ReconnectingClientFactory):
@@ -1781,6 +1786,13 @@ class RedisFactory(protocol.ReconnectingClientFactory):
         self._waitingForZeroConnectors = set()
         self.connectors = set()
         self.disconnectCalled = False
+        self._waitingForConnection = []
+
+    @defer.inlineCallbacks
+    def waitForConnection(self):
+        if len(self.connectionQueue.pending) == 0:
+            self._waitingForConnection.append(defer.Deferred())
+            yield self._waitingForConnection[-1]
 
     def GetStatus(self):
         return {
@@ -1806,9 +1818,15 @@ class RedisFactory(protocol.ReconnectingClientFactory):
             conn.transport.loseConnection()
             return
 
-        self.connectionQueue.put(conn)
         self.pool.append(conn)
         self.size = len(self.pool)
+        self.connectionQueue.put(conn)
+
+        # signal anyone waiting for a connection
+        w = self._waitingForConnection[:]
+        self._waitingForConnection[:] = []
+        for d in w:
+            d.callback(None)
 
         if self.deferred is not None:
             if self.size == self.poolsize:
@@ -1870,27 +1888,17 @@ class RedisFactory(protocol.ReconnectingClientFactory):
             self.deferred = None
             d.errback(ValueError(why))
 
-    # there must be a better way to unblock requests waiting on connectionQueue
-    def _errback_connection_queue(self, err):
-        if len(self.connectionQueue.waiting) == 0:
-            self.connectionQueue.put_for_pending_peekers(err)
-
-        for i in range(len(self.connectionQueue.waiting)):
-            self.connectionQueue.put(err)
-
     @defer.inlineCallbacks
-    def getConnection(self, peek=False):
-        if not self.continueTrying and not self.size:
-            raise ConnectionError("Not connected")
+    def getConnection(self, peek=False, ignore_not_connected=False):
+        if not ignore_not_connected:
+            if not self.continueTrying and not self.size:
+                raise ConnectionError("Not connected")
 
         while True:
             if peek:
                 conn = yield self.connectionQueue.peek()
             else:
                 conn = yield self.connectionQueue.get()
-
-            if isinstance(conn, Failure):
-                conn.raiseException()
 
             if conn.connected == 0:
                 log.msg('Discarding dead connection.')
@@ -1920,7 +1928,7 @@ class RedisFactory(protocol.ReconnectingClientFactory):
         protocol.ReconnectingClientFactory.clientConnectionFailed(self, connector, reason)
 
         if not self._will_retry_connection():
-            self._errback_connection_queue(reason)
+            self.connectionQueue.signal_error(reason)
 
             if self.deferred is not None:
                 d = self.deferred
@@ -1938,7 +1946,7 @@ class RedisFactory(protocol.ReconnectingClientFactory):
         protocol.ReconnectingClientFactory.clientConnectionLost(self, connector, reason)
 
         if not self._will_retry_connection():
-            self._errback_connection_queue(reason)
+            self.connectionQueue.signal_error(reason)
 
             if self.deferred is not None:
                 d = self.deferred
