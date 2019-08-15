@@ -67,7 +67,7 @@ class TestConnectionMethods(unittest.TestCase):
     def test_lazyConnection(self):
         db = redis.lazyConnection(REDIS_HOST, REDIS_PORT, reconnect=False)
         self.assertEqual(repr(db), '<Redis Connection: Not connected>')
-        conn = yield db._factory.waitForConnection()
+        yield db._factory.waitForConnection()
         yield db.ping()
         self.assertNotEqual(repr(db), '<Redis Connection: Not connected>')
         self.assertIsInstance(db, redis.ConnectionHandler)
@@ -77,7 +77,7 @@ class TestConnectionMethods(unittest.TestCase):
     def test_lazyConnectionPool(self):
         db = redis.lazyConnectionPool(REDIS_HOST, REDIS_PORT, reconnect=False)
         self.assertEqual(repr(db), '<Redis Connection: Not connected>')
-        conn = yield db._factory.waitForConnection()
+        yield db._factory.waitForConnection()
         yield db.ping()
         self.assertNotEqual(repr(db), '<Redis Connection: Not connected>')
         self.assertIsInstance(db, redis.ConnectionHandler)
