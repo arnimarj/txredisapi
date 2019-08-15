@@ -24,30 +24,21 @@
 
 import six
 
-import bisect
-import collections
-import functools
 import operator
-import re
 import warnings
-import zlib
 import string
 import hashlib
 import random
+import itertools
+import hiredis
 
 from twisted.internet import defer
 from twisted.internet import protocol
 from twisted.internet import reactor
-from twisted.internet.tcp import Connector
 from twisted.protocols import basic
 from twisted.protocols import policies
 from twisted.python import log
 from twisted.python.failure import Failure
-
-try:
-    import hiredis
-except ImportError:
-    hiredis = None
 
 
 class RedisError(Exception):
@@ -273,18 +264,7 @@ class BaseRedisProtocol(LineReceiver, policies.TimeoutMixin):
         self.multi_bulk = MultiBulkStorage()
 
         self.replyQueue = ReplyQueue()
-
-        self.transactions = 0
-        self.inTransaction = False
-        self.inMulti = False
-        self.unwatch_cc = lambda: ()
-        self.commit_cc = lambda: ()
-
         self.script_hashes = set()
-
-        self.pipelining = False
-        self.pipelined_commands = []
-        self.pipelined_replies = []
 
     @defer.inlineCallbacks
     def connectionMade(self):
@@ -390,14 +370,10 @@ class BaseRedisProtocol(LineReceiver, policies.TimeoutMixin):
                     self.multiBulkDataReceived()
 
         elif token == "+":  # single line status
-            if data == "QUEUED":
-                self.transactions += 1
-                self.replyReceived(data)
+            if self.multi_bulk.pending:
+                self.handleMultiBulkElement(data)
             else:
-                if self.multi_bulk.pending:
-                    self.handleMultiBulkElement(data)
-                else:
-                    self.replyReceived(data)
+                self.replyReceived(data)
 
         elif token == "-":  # error
             reply = ResponseError(data[4:] if data[:4] == "ERR" else data)
@@ -503,29 +479,7 @@ class BaseRedisProtocol(LineReceiver, policies.TimeoutMixin):
         if not self.multi_bulk.pending:
             reply = self.multi_bulk.items
             self.multi_bulk = MultiBulkStorage()
-
-            reply = self.handleTransactionData(reply)
-
             self.replyReceived(reply)
-
-    def handleTransactionData(self, reply):
-        if self.inTransaction and isinstance(reply, list):
-            # watch or multi has been called
-            if self.transactions > 0:
-                # multi: this must be an exec [commit] reply
-                self.transactions -= len(reply)
-            if self.transactions == 0:
-                self.commit_cc()
-            if not self.inTransaction:  # multi: this must be an exec reply
-                tmp = []
-                for f, v in zip(self.post_proc[1:], reply):
-                    if callable(f):
-                        tmp.append(f(v))
-                    else:
-                        tmp.append(v)
-                    reply = tmp
-            self.post_proc = []
-        return reply
 
     def replyReceived(self, reply):
         """
@@ -586,36 +540,20 @@ class BaseRedisProtocol(LineReceiver, policies.TimeoutMixin):
             raise ConnectionError("Not connected")
         else:
             command = self._build_command(*args, **kwargs)
-            # When pipelining, buffer this command into our list of
-            # pipelined commands. Otherwise, write the command immediately.
-            if self.pipelining:
-                self.pipelined_commands.append(command)
-            else:
-                self.transport.write(command)
+            self.transport.write(command)
 
             # Return deferred that will contain the result of this command.
-            # Note: when using pipelining, this deferred will NOT return
-            # until after execute_pipeline is called.
-
             # timeout: reset the timeout if there are no pending requests
             if len(self.replyQueue.waiting) == 0:
                 self.resetTimeout()
 
             r = self.replyQueue.get().addCallback(self.handle_reply)
 
-            # When pipelining, we need to keep track of the deferred replies
-            # so that we can wait for them in a DeferredList when
-            # execute_pipeline is called.
-            if self.pipelining:
-                self.pipelined_replies.append(r)
+            if "post_proc" in kwargs:
+                f = kwargs["post_proc"]
+                if callable(f):
+                    r.addCallback(f)
 
-            if self.inMulti:
-                self.post_proc.append(kwargs.get("post_proc"))
-            else:
-                if "post_proc" in kwargs:
-                    f = kwargs["post_proc"]
-                    if callable(f):
-                        r.addCallback(f)
             return r
 
     ##
@@ -1505,119 +1443,6 @@ class BaseRedisProtocol(LineReceiver, policies.TimeoutMixin):
 
         return self.execute_command("SORT", *pieces)
 
-    def _clear_txstate(self):
-        if self.inTransaction:
-            self.inTransaction = False
-            self.inMulti = False
-            self.factory.connectionQueue.put(self)
-
-    @_blocking_command(release_on_callback=False)
-    def watch(self, keys):
-        if not self.inTransaction:
-            self.inTransaction = True
-            self.inMulti = False
-            self.unwatch_cc = self._clear_txstate
-            self.commit_cc = lambda: ()
-        if isinstance(keys, six.string_types):
-            keys = [keys]
-        d = self.execute_command("WATCH", *keys).addCallback(self._tx_started)
-        return d
-
-    def unwatch(self):
-        self.unwatch_cc()
-        return self.execute_command("UNWATCH")
-
-    # Transactions
-    # multi() will return a deferred with a "connection" object
-    # That object must be used for further interactions within
-    # the transaction. At the end, either exec() or discard()
-    # must be executed.
-    @_blocking_command(release_on_callback=False)
-    def multi(self, keys=None):
-        self.inTransaction = True
-        self.inMulti = True
-        self.unwatch_cc = lambda: ()
-        self.commit_cc = self._clear_txstate
-        if keys is not None:
-            d = self.watch(keys)
-            d.addCallback(lambda _: self.execute_command("MULTI"))
-        else:
-            d = self.execute_command("MULTI")
-        d.addCallback(self._tx_started)
-        return d
-
-    def _tx_started(self, response):
-        if response != 'OK':
-            raise RedisError('Invalid response: %s' % response)
-        return self
-
-    def _commit_check(self, response):
-        if response is None:
-            self.transactions = 0
-            self._clear_txstate()
-            raise WatchError("Transaction failed")
-        else:
-            return response
-
-    def commit(self):
-        if self.inMulti is False:
-            raise RedisError("Not in transaction")
-        return self.execute_command("EXEC").addCallback(self._commit_check)
-
-    def discard(self):
-        if self.inMulti is False:
-            raise RedisError("Not in transaction")
-        self.post_proc = []
-        self.transactions = 0
-        self._clear_txstate()
-        return self.execute_command("DISCARD")
-
-    # Returns a proxy that works just like .multi() except that commands
-    # are simply buffered to be written all at once in a pipeline.
-    # http://redis.io/topics/pipelining
-    @_blocking_command(release_on_callback=False)
-    def pipeline(self):
-
-        # Return a deferred that returns self (rather than simply self) to allow
-        # ConnectionHandler to wrap this method with async connection retrieval.
-        self.pipelining = True
-        self.pipelined_commands = []
-        self.pipelined_replies = []
-        return defer.succeed(self)
-
-    @defer.inlineCallbacks
-    def execute_pipeline(self):
-        if not self.pipelining:
-            err = "Not currently pipelining commands, " \
-                  "please use pipeline() first"
-            raise RedisError(err)
-
-        # Flush all the commands at once to redis. Wait for all replies
-        # to come back using a deferred list.
-        self.transport.write(six.b("").join(self.pipelined_commands))
-
-        d = defer.DeferredList(
-            deferredList=self.pipelined_replies,
-            fireOnOneErrback=True,
-            consumeErrors=True,
-            )
-
-        d.addBoth(self._clear_pipeline_state)
-
-        results = yield d
-
-        defer.returnValue([value for success, value in results])
-
-    def _clear_pipeline_state(self, response):
-        if self.pipelining:
-            self.pipelining = False
-            self.pipelined_commands = []
-            self.pipelined_replies = []
-            self.factory.connectionQueue.put(self)
-
-        return response
-
-    # Publish/Subscribe
     # see the SubscriberProtocol for subscribing to channels
     def publish(self, channel, message):
         """
@@ -1776,48 +1601,11 @@ class BaseRedisProtocol(LineReceiver, policies.TimeoutMixin):
         sourceKeys = list_or_args("pfmerge", sourceKeys, args)
         return self.execute_command("PFMERGE", destKey, *sourceKeys)
 
-    _SENTINEL_NODE_FLAGS = (("is_master", "master"), ("is_slave", "slave"),
-                            ("is_sdown", "s_down"), ("is_odown", "o_down"),
-                            ("is_sentinel", "sentinel"),
-                            ("is_disconnected", "disconnected"),
-                            ("is_master_down", "master_down"))
-
-    def _parse_sentinel_state(self, state_array):
-        as_dict = dict(
-            (self.tryConvertData(key), self.tryConvertData(value))
-            for key, value in zip(state_array[::2], state_array[1::2])
-        )
-        flags = set(as_dict['flags'].split(','))
-        for bool_name, flag_name in self._SENTINEL_NODE_FLAGS:
-            as_dict[bool_name] = flag_name in flags
-        return as_dict
-
-    def sentinel_masters(self):
-        def convert(raw):
-            result = {}
-            for array in raw:
-                as_dict = self._parse_sentinel_state(array)
-                result[as_dict['name']] = as_dict
-            return result
-        return self.execute_command("SENTINEL", "MASTERS").addCallback(convert)
-
-    def sentinel_slaves(self, service_name):
-        def convert(raw):
-            return [
-                self._parse_sentinel_state(array)
-                for array in raw
-            ]
-        return self.execute_command("SENTINEL", "SLAVES", service_name)\
-            .addCallback(convert)
-
-    def sentinel_get_master_addr_by_name(self, service_name):
-        return self.execute_command("SENTINEL", "GET-MASTER-ADDR-BY-NAME", service_name)
-
     def role(self):
         return self.execute_command("ROLE")
 
 
-class HiredisProtocol(BaseRedisProtocol):
+class RedisProtocol(BaseRedisProtocol):
     def __init__(self, *args, **kwargs):
         BaseRedisProtocol.__init__(self, *args, **kwargs)
         self._reader = hiredis.Reader(protocolError=InvalidData,
@@ -1832,10 +1620,6 @@ class HiredisProtocol(BaseRedisProtocol):
         while res is not False:
             if isinstance(res, (six.text_type, six.binary_type, list)):
                 res = self.tryConvertData(res)
-            if res == "QUEUED":
-                self.transactions += 1
-            else:
-                res = self.handleTransactionData(res)
 
             self.replyReceived(res)
             res = self._reader.gets()
@@ -1862,72 +1646,10 @@ class HiredisProtocol(BaseRedisProtocol):
         r = BaseRedisProtocol.sscan(self, key, cursor, pattern, count)
         return r.addCallback(self._convert_bin_values)
 
-if hiredis is not None:
-    RedisProtocol = HiredisProtocol
-else:
-    RedisProtocol = BaseRedisProtocol
-
-class MonitorProtocol(RedisProtocol):
-    """
-    monitor has the same behavior as subscribe: hold the connection until
-    something happens.
-
-    take care with the performance impact: http://redis.io/commands/monitor
-    """
-
-    def messageReceived(self, message):
-        pass
-
-    def replyReceived(self, reply):
-        self.messageReceived(reply)
-
-    def monitor(self):
-        return self.execute_command("MONITOR")
-
-    def stop(self):
-        self.transport.loseConnection()
-
-
-class SubscriberProtocol(RedisProtocol):
-    def messageReceived(self, pattern, channel, message):
-        pass
-
-    def replyReceived(self, reply):
-        if isinstance(reply, list):
-            if reply[-3] == u"message":
-                self.messageReceived(None, *reply[-2:])
-            elif len(reply) > 3 and reply[-4] == u"pmessage":
-                self.messageReceived(*reply[-3:])
-            else:
-                self.replyQueue.put(reply[-3:])
-        else:
-            self.replyQueue.put(reply)
-
-    def subscribe(self, channels):
-        if isinstance(channels, six.string_types):
-            channels = [channels]
-        return self.execute_command("SUBSCRIBE", *channels)
-
-    def unsubscribe(self, channels):
-        if isinstance(channels, six.string_types):
-            channels = [channels]
-        return self.execute_command("UNSUBSCRIBE", *channels)
-
-    def psubscribe(self, patterns):
-        if isinstance(patterns, six.string_types):
-            patterns = [patterns]
-        return self.execute_command("PSUBSCRIBE", *patterns)
-
-    def punsubscribe(self, patterns):
-        if isinstance(patterns, six.string_types):
-            patterns = [patterns]
-        return self.execute_command("PUNSUBSCRIBE", *patterns)
-
 
 class ConnectionHandler(object):
     def __init__(self, factory):
         self._factory = factory
-        self._connected = factory.deferred
 
     def GetStatus(self):
         return {
@@ -1985,232 +1707,6 @@ class ConnectionHandler(object):
                    (cli.host, cli.port, self._factory.size)
 
 
-class UnixConnectionHandler(ConnectionHandler):
-    def __repr__(self):
-        try:
-            cli = self._factory.pool[0].transport.getPeer()
-        except:
-            return "<Redis Connection: Not connected>"
-        else:
-            return "<Redis Unix Connection: %s - %d connection(s)>" % \
-                   (cli.name, self._factory.size)
-
-
-ShardedMethods = frozenset([
-    "decr",
-    "delete",
-    "exists",
-    "expire",
-    "get",
-    "get_type",
-    "getset",
-    "hdel",
-    "hexists",
-    "hget",
-    "hgetall",
-    "hincrby",
-    "hkeys",
-    "hlen",
-    "hmget",
-    "hmset",
-    "hset",
-    "hvals",
-    "incr",
-    "lindex",
-    "llen",
-    "lrange",
-    "lrem",
-    "lset",
-    "ltrim",
-    "pop",
-    "publish",
-    "push",
-    "rename",
-    "sadd",
-    "set",
-    "setex",
-    "setnx",
-    "sismember",
-    "smembers",
-    "srem",
-    "ttl",
-    "zadd",
-    "zcard",
-    "zcount",
-    "zdecr",
-    "zincr",
-    "zincrby",
-    "zrange",
-    "zrangebyscore",
-    "zrevrangebyscore",
-    "zrevrank",
-    "zrank",
-    "zrem",
-    "zremrangebyscore",
-    "zremrangebyrank",
-    "zrevrange",
-    "zscore"
-])
-
-_findhash = re.compile(r'.+\{(.*)\}.*')
-
-
-class HashRing(object):
-    """Consistent hash for redis API"""
-    def __init__(self, nodes=[], replicas=160):
-        self.nodes = []
-        self.replicas = replicas
-        self.ring = {}
-        self.sorted_keys = []
-
-        for n in nodes:
-            self.add_node(n)
-
-    def add_node(self, node):
-        self.nodes.append(node)
-        for x in range(self.replicas):
-            uuid = node._factory.uuid
-            if isinstance(uuid, six.text_type):
-                uuid = uuid.encode()
-            crckey = zlib.crc32(six.b(":").join(
-                [uuid, str(x).format().encode()]))
-            self.ring[crckey] = node
-            self.sorted_keys.append(crckey)
-
-        self.sorted_keys.sort()
-
-    def remove_node(self, node):
-        self.nodes.remove(node)
-        for x in range(self.replicas):
-            crckey = zlib.crc32(six.b(":").join(
-                [node, str(x).format().encode()]))
-            self.ring.remove(crckey)
-            self.sorted_keys.remove(crckey)
-
-    def get_node(self, key):
-        n, i = self.get_node_pos(key)
-        return n
-    # self.get_node_pos(key)[0]
-
-    def get_node_pos(self, key):
-        if len(self.ring) == 0:
-            return [None, None]
-        crc = zlib.crc32(key)
-        idx = bisect.bisect(self.sorted_keys, crc)
-        # prevents out of range index
-        idx = min(idx, (self.replicas * len(self.nodes)) - 1)
-        return [self.ring[self.sorted_keys[idx]], idx]
-
-    def iter_nodes(self, key):
-        if len(self.ring) == 0:
-            yield None, None
-        node, pos = self.get_node_pos(key)
-        for k in self.sorted_keys[pos:]:
-            yield k, self.ring[k]
-
-    def __call__(self, key):
-        return self.get_node(key)
-
-
-class ShardedConnectionHandler(object):
-    def __init__(self, connections):
-        if isinstance(connections, defer.DeferredList):
-            self._ring = None
-            connections.addCallback(self._makeRing)
-        else:
-            self._ring = HashRing(connections)
-
-    def _makeRing(self, connections):
-        connections = list(map(operator.itemgetter(1), connections))
-        self._ring = HashRing(connections)
-        return self
-
-    @defer.inlineCallbacks
-    def disconnect(self):
-        if not self._ring:
-            raise ConnectionError("Not connected")
-
-        for conn in self._ring.nodes:
-            yield conn.disconnect()
-        defer.returnValue(True)
-
-    def _wrap(self, method, *args, **kwargs):
-        try:
-            key = args[0]
-            assert isinstance(key, six.string_types)
-        except:
-            raise ValueError(
-                "Method '%s' requires a key as the first argument" % method)
-
-        m = _findhash.match(key)
-        if m is not None and len(m.groups()) >= 1:
-            node = self._ring(m.groups()[0])
-        else:
-            node = self._ring(key)
-
-        return getattr(node, method)(*args, **kwargs)
-
-    def pipeline(self):
-        raise NotImplementedError("Pipelining is not supported across shards")
-
-    def __getattr__(self, method):
-        if method in ShardedMethods:
-            return functools.partial(self._wrap, method)
-        else:
-            raise NotImplementedError("Method '%s' cannot be sharded" % method)
-
-    @defer.inlineCallbacks
-    def mget(self, keys, *args):
-        """
-        high-level mget, required because of the sharding support
-        """
-
-        keys = list_or_args("mget", keys, args)
-        group = collections.defaultdict(lambda: [])
-        for k in keys:
-            node = self._ring(k)
-            group[node].append(k)
-
-        deferreds = []
-        for node, keys in six.iteritems(group.items):
-            nd = node.mget(keys)
-            deferreds.append(nd)
-
-        result = []
-        response = yield defer.DeferredList(deferreds)
-        for (success, values) in response:
-            if success:
-                result += values
-
-        defer.returnValue(result)
-
-    def __repr__(self):
-        nodes = []
-        for conn in self._ring.nodes:
-            try:
-                cli = conn._factory.pool[0].transport.getPeer()
-            except:
-                pass
-            else:
-                nodes.append(six.b("%s:%s/%d") %
-                             (cli.host, cli.port, conn._factory.size))
-        return "<Redis Sharded Connection: %s>" % ", ".join(nodes)
-
-
-class ShardedUnixConnectionHandler(ShardedConnectionHandler):
-    def __repr__(self):
-        nodes = []
-        for conn in self._ring.nodes:
-            try:
-                cli = conn._factory.pool[0].transport.getPeer()
-            except:
-                pass
-            else:
-                nodes.append(six.b("%s/%d") %
-                             (cli.name, conn._factory.size))
-        return "<Redis Sharded Connection: %s>" % ", ".join(nodes)
-
-
 class PeekableQueue(defer.DeferredQueue):
     """
     A DeferredQueue that supports peeking, accessing random item without
@@ -2218,14 +1714,16 @@ class PeekableQueue(defer.DeferredQueue):
     """
     def __init__(self, *args, **kwargs):
         defer.DeferredQueue.__init__(self, *args, **kwargs)
-
         self.peekers = []
 
     def peek(self):
         if self.pending:
             return defer.succeed(random.choice(self.pending))
         else:
-            d = defer.Deferred()
+            def _cancel(d):
+                self.peekers.remove(d)
+
+            d = defer.Deferred(canceller=_cancel)
             self.peekers.append(d)
             return d
 
@@ -2233,11 +1731,21 @@ class PeekableQueue(defer.DeferredQueue):
         self.pending.remove(item)
 
     def put(self, obj):
-        for d in self.peekers:
+        peekers = self.peekers[:]
+        self.peekers[:] = []
+
+        for d in peekers:
             d.callback(obj)
-        self.peekers = []
 
         defer.DeferredQueue.put(self, obj)
+
+    def signal_error(self, err):
+        deferreds = list(itertools.chain(self.peekers, self.waiting))
+        self.peekers[:] = []
+        self.waiting[:] = []
+
+        for d in deferreds:
+            d.errback(err)
 
 
 class RedisFactory(protocol.ReconnectingClientFactory):
@@ -2268,13 +1776,20 @@ class RedisFactory(protocol.ReconnectingClientFactory):
         self.idx = 0
         self.size = 0
         self.pool = []
-        self.deferred = defer.Deferred()
+        self.deferred = None if isLazy else defer.Deferred()
         self.handler = handler(self)
         self.connectionQueue = PeekableQueue()
         self._waitingForEmptyPool = set()
         self._waitingForZeroConnectors = set()
         self.connectors = set()
         self.disconnectCalled = False
+        self._waitingForConnection = []
+
+    @defer.inlineCallbacks
+    def waitForConnection(self):
+        if len(self.connectionQueue.pending) == 0:
+            self._waitingForConnection.append(defer.Deferred())
+            yield self._waitingForConnection[-1]
 
     def GetStatus(self):
         return {
@@ -2286,7 +1801,6 @@ class RedisFactory(protocol.ReconnectingClientFactory):
             'connector': str(self.connector),
             'continueTrying': str(self.continueTrying),
         }
-
 
     def buildProtocol(self, addr):
         if hasattr(self, 'charset'):
@@ -2301,13 +1815,21 @@ class RedisFactory(protocol.ReconnectingClientFactory):
             conn.transport.loseConnection()
             return
 
-        self.connectionQueue.put(conn)
         self.pool.append(conn)
         self.size = len(self.pool)
-        if self.deferred:
+        self.connectionQueue.put(conn)
+
+        # signal anyone waiting for a connection
+        w = self._waitingForConnection[:]
+        self._waitingForConnection[:] = []
+        for d in w:
+            d.callback(None)
+
+        if self.deferred is not None:
             if self.size == self.poolsize:
-                self.deferred.callback(self.handler)
+                d = self.deferred
                 self.deferred = None
+                d.callback(self.handler)
 
     def delConnection(self, conn):
         if self.logger is not None:
@@ -2358,28 +1880,22 @@ class RedisFactory(protocol.ReconnectingClientFactory):
         if self.logger is not None:
             self.logger.warning('connectionError', why = why)
 
-        if self.deferred:
-            self.deferred.errback(ValueError(why))
+        if self.deferred is not None:
+            d = self.deferred
             self.deferred = None
-
-    # there must be a better way to unblock requests waiting on connectionQueue
-    def _errback_connection_queue(self, err):
-        for i in range(len(self.connectionQueue.waiting)):
-            self.connectionQueue.put(err)
+            d.errback(ValueError(why))
 
     @defer.inlineCallbacks
-    def getConnection(self, peek=False):
-        if not self.continueTrying and not self.size:
-            raise ConnectionError("Not connected")
+    def getConnection(self, peek=False, ignore_not_connected=False):
+        if not ignore_not_connected:
+            if not self.continueTrying and not self.size:
+                raise ConnectionError("Not connected")
 
         while True:
             if peek:
                 conn = yield self.connectionQueue.peek()
             else:
                 conn = yield self.connectionQueue.get()
-
-            if isinstance(conn, Failure):
-                conn.raieException()
 
             if conn.connected == 0:
                 log.msg('Discarding dead connection.')
@@ -2404,15 +1920,17 @@ class RedisFactory(protocol.ReconnectingClientFactory):
     def clientConnectionFailed(self, connector, reason):
         if self.logger is not None:
             self.logger.warning('clientConnectionFailed', reason = str(reason))
+
         self._delConnector(connector)
         protocol.ReconnectingClientFactory.clientConnectionFailed(self, connector, reason)
 
         if not self._will_retry_connection():
-            self._errback_connection_queue(reason)
+            self.connectionQueue.signal_error(reason)
 
-            if self.deferred != None:
-                self.deferred.errback(reason)
+            if self.deferred is not None:
+                d = self.deferred
                 self.deferred = None
+                d.errback(reason)
 
     def startedConnecting(self, connector):
         self._addConnector(connector)
@@ -2420,14 +1938,17 @@ class RedisFactory(protocol.ReconnectingClientFactory):
     def clientConnectionLost(self, connector, reason):
         if self.logger is not None:
             self.logger.warning('clientConnectionLost', reason = str(reason))
+
         self._delConnector(connector)
         protocol.ReconnectingClientFactory.clientConnectionLost(self, connector, reason)
-        if not self._will_retry_connection():
-            self._errback_connection_queue(reason)
 
-            if self.deferred:
-                self.deferred.errback(reason)
+        if not self._will_retry_connection():
+            self.connectionQueue.signal_error(reason)
+
+            if self.deferred is not None:
+                d = self.deferred
                 self.deferred = None
+                d.errback(reason)
 
     def _addConnector(self, connector):
         self.connectors.add(connector)
@@ -2441,22 +1962,6 @@ class RedisFactory(protocol.ReconnectingClientFactory):
                 d.callback(None)
 
 
-class SubscriberFactory(RedisFactory):
-    protocol = SubscriberProtocol
-
-    def __init__(self, isLazy=False, handler=ConnectionHandler):
-        RedisFactory.__init__(self, None, None, 1, isLazy=isLazy,
-                              handler=handler)
-
-
-class MonitorFactory(RedisFactory):
-    protocol = MonitorProtocol
-
-    def __init__(self, isLazy=False, handler=ConnectionHandler):
-        RedisFactory.__init__(self, None, None, 1, isLazy=isLazy,
-                              handler=handler)
-
-
 def makeConnection(host, port, dbid, poolsize, reconnect, isLazy,
                    charset, password, connectTimeout, replyTimeout,
                    convertNumbers, logger):
@@ -2464,6 +1969,7 @@ def makeConnection(host, port, dbid, poolsize, reconnect, isLazy,
     factory = RedisFactory(uuid, dbid, poolsize, isLazy, ConnectionHandler,
                            charset, password, replyTimeout, convertNumbers, logger)
     factory.continueTrying = reconnect
+
     for x in range(poolsize):
         reactor.connectTCP(host, port, factory, connectTimeout)
 
@@ -2471,34 +1977,6 @@ def makeConnection(host, port, dbid, poolsize, reconnect, isLazy,
         return factory.handler
     else:
         return factory.deferred
-
-
-def makeShardedConnection(hosts, dbid, poolsize, reconnect, isLazy,
-                          charset, password, connectTimeout, replyTimeout,
-                          convertNumbers, logger):
-    err = "Please use a list or tuple of host:port for sharded connections"
-    if not isinstance(hosts, (list, tuple)):
-        raise ValueError(err)
-
-    connections = []
-    for item in hosts:
-        try:
-            host, port = item.split(":")
-            port = int(port)
-        except:
-            raise ValueError(err)
-
-        c = makeConnection(host, port, dbid, poolsize, reconnect, isLazy,
-                           charset, password, connectTimeout, replyTimeout,
-                           convertNumbers, logger)
-        connections.append(c)
-
-    if isLazy:
-        return ShardedConnectionHandler(connections)
-    else:
-        deferred = defer.DeferredList(connections)
-        ShardedConnectionHandler(deferred)
-        return deferred
 
 
 def Connection(host="localhost", port=6379, dbid=None, reconnect=True,
@@ -2535,348 +2013,9 @@ def lazyConnectionPool(host="localhost", port=6379, dbid=None,
                           convertNumbers, logger)
 
 
-def ShardedConnection(hosts, dbid=None, reconnect=True, charset="utf-8",
-                      password=None, connectTimeout=None, replyTimeout=None,
-                      convertNumbers=True,logger=None):
-    return makeShardedConnection(hosts, dbid, 1, reconnect, False,
-                                 charset, password, connectTimeout,
-                                 replyTimeout, convertNumbers, logger)
-
-
-def lazyShardedConnection(hosts, dbid=None, reconnect=True, charset="utf-8",
-                          password=None,
-                          connectTimeout=None, replyTimeout=None,
-                          convertNumbers=True, logger=None):
-    return makeShardedConnection(hosts, dbid, 1, reconnect, True,
-                                 charset, password, connectTimeout,
-                                 replyTimeout, convertNumbers, logger)
-
-
-def ShardedConnectionPool(hosts, dbid=None, poolsize=10, reconnect=True,
-                          charset="utf-8", password=None,
-                          connectTimeout=None, replyTimeout=None,
-                          convertNumbers=True, logger=None):
-    return makeShardedConnection(hosts, dbid, poolsize, reconnect, False,
-                                 charset, password, connectTimeout,
-                                 replyTimeout, convertNumbers, logger)
-
-
-def lazyShardedConnectionPool(hosts, dbid=None, poolsize=10, reconnect=True,
-                              charset="utf-8", password=None,
-                              connectTimeout=None, replyTimeout=None,
-                              convertNumbers=True, logger=None):
-    return makeShardedConnection(hosts, dbid, poolsize, reconnect, True,
-                                 charset, password, connectTimeout,
-                                 replyTimeout, convertNumbers, logger)
-
-
-def makeUnixConnection(path, dbid, poolsize, reconnect, isLazy,
-                       charset, password, connectTimeout, replyTimeout,
-                       convertNumbers, logger=None):
-    factory = RedisFactory(path, dbid, poolsize, isLazy, UnixConnectionHandler,
-                           charset, password, replyTimeout, convertNumbers, logger)
-    factory.continueTrying = reconnect
-    for x in range(poolsize):
-        reactor.connectUNIX(path, factory, connectTimeout)
-
-    if isLazy:
-        return factory.handler
-    else:
-        return factory.deferred
-
-
-def makeShardedUnixConnection(paths, dbid, poolsize, reconnect, isLazy,
-                              charset, password, connectTimeout, replyTimeout,
-                              convertNumbers, logger=None):
-    err = "Please use a list or tuple of paths for sharded unix connections"
-    if not isinstance(paths, (list, tuple)):
-        raise ValueError(err)
-
-    connections = []
-    for path in paths:
-        c = makeUnixConnection(path, dbid, poolsize, reconnect, isLazy,
-                               charset, password, connectTimeout, replyTimeout,
-                               convertNumbers, logger)
-        connections.append(c)
-
-    if isLazy:
-        return ShardedUnixConnectionHandler(connections)
-    else:
-        deferred = defer.DeferredList(connections)
-        ShardedUnixConnectionHandler(deferred)
-        return deferred
-
-
-def UnixConnection(path="/tmp/redis.sock", dbid=None, reconnect=True,
-                   charset="utf-8", password=None,
-                   connectTimeout=None, replyTimeout=None, convertNumbers=True, logger=None):
-    return makeUnixConnection(path, dbid, 1, reconnect, False,
-                              charset, password, connectTimeout, replyTimeout,
-                              convertNumbers, logger)
-
-
-def lazyUnixConnection(path="/tmp/redis.sock", dbid=None, reconnect=True,
-                       charset="utf-8", password=None,
-                       connectTimeout=None, replyTimeout=None,
-                       convertNumbers=True, logger=None):
-    return makeUnixConnection(path, dbid, 1, reconnect, True,
-                              charset, password, connectTimeout, replyTimeout,
-                              convertNumbers, logger)
-
-
-def UnixConnectionPool(path="/tmp/redis.sock", dbid=None, poolsize=10,
-                       reconnect=True, charset="utf-8", password=None,
-                       connectTimeout=None, replyTimeout=None,
-                       convertNumbers=True, logger=None):
-    return makeUnixConnection(path, dbid, poolsize, reconnect, False,
-                              charset, password, connectTimeout, replyTimeout,
-                              convertNumbers, logger)
-
-
-def lazyUnixConnectionPool(path="/tmp/redis.sock", dbid=None, poolsize=10,
-                           reconnect=True, charset="utf-8", password=None,
-                           connectTimeout=None, replyTimeout=None,
-                           convertNumbers=True, logger=None):
-    return makeUnixConnection(path, dbid, poolsize, reconnect, True,
-                              charset, password, connectTimeout, replyTimeout,
-                              convertNumbers, logger)
-
-
-def ShardedUnixConnection(paths, dbid=None, reconnect=True, charset="utf-8",
-                          password=None, connectTimeout=None, replyTimeout=None,
-                          convertNumbers=True, logger=None):
-    return makeShardedUnixConnection(paths, dbid, 1, reconnect, False,
-                                     charset, password, connectTimeout,
-                                     replyTimeout, convertNumbers, logger)
-
-
-def lazyShardedUnixConnection(paths, dbid=None, reconnect=True,
-                              charset="utf-8", password=None,
-                              connectTimeout=None, replyTimeout=None,
-                              convertNumbers=True, logger=None):
-    return makeShardedUnixConnection(paths, dbid, 1, reconnect, True,
-                                     charset, password, connectTimeout,
-                                     replyTimeout, convertNumbers, logger)
-
-
-def ShardedUnixConnectionPool(paths, dbid=None, poolsize=10, reconnect=True,
-                              charset="utf-8", password=None,
-                              connectTimeout=None, replyTimeout=None,
-                              convertNumbers=True, logger=None):
-    return makeShardedUnixConnection(paths, dbid, poolsize, reconnect, False,
-                                     charset, password, connectTimeout,
-                                     replyTimeout, convertNumbers, logger)
-
-
-def lazyShardedUnixConnectionPool(paths, dbid=None, poolsize=10,
-                                  reconnect=True, charset="utf-8",
-                                  password=None, connectTimeout=None,
-                                  replyTimeout=None, convertNumbers=True, logger=None):
-    return makeShardedUnixConnection(paths, dbid, poolsize, reconnect, True,
-                                     charset, password, connectTimeout,
-                                     replyTimeout, convertNumbers, logger)
-
-
-class MasterNotFoundError(ConnectionError):
-    pass
-
-
-class SentinelRedisProtocol(RedisProtocol):
-
-    def connectionMade(self):
-        self.factory.resetDelay()
-
-        def check_role(role):
-            if self.factory.is_master and role[0] != "master":
-                self.transport.loseConnection()
-            else:
-                RedisProtocol.connectionMade(self)
-                self.factory.resetDelay()
-
-        return self.role().addCallback(check_role)
-
-
-class SentinelConnectionFactory(RedisFactory):
-
-    initialDelay = 0.1
-    protocol = SentinelRedisProtocol
-
-    def __init__(self, sentinel_manager, service_name, is_master, *args, **kwargs):
-        RedisFactory.__init__(self, *args, **kwargs)
-
-        self.sentinel_manager = sentinel_manager
-        self.service_name = service_name
-        self.is_master = is_master
-
-        self._current_master_addr = None
-        self._slave_no = 0
-
-    def clientConnectionFailed(self, connector, reason):
-        self.try_to_connect(connector)
-
-    def clientConnectionLost(self, connector, unused_reason):
-        self.try_to_connect(connector, nodelay=True)
-
-    def try_to_connect(self, connector, force_master=False, nodelay=False):
-        if not self.continueTrying:
-            return
-
-        def on_discovery_err(failure):
-            failure.trap(MasterNotFoundError)
-            log.msg("txredisapi: Can't get address from Sentinel: {0}".format(failure.value))
-            reactor.callLater(self.delay, self.try_to_connect, connector)
-            self.resetDelay()
-
-        def on_master_addr(addr):
-            if self._current_master_addr is not None and \
-               self._current_master_addr != addr:
-                self.resetDelay()
-                # master has changed, dropping all alive connections
-                for conn in self.pool:
-                    conn.transport.loseConnection()
-
-            self._current_master_addr = addr
-            connector.host, connector.port = addr
-            if nodelay:
-                connector.connect()
-            else:
-                self.retry(connector)
-
-        def on_slave_addrs(addrs):
-            if addrs:
-                connector.host, connector.port = addrs[self._slave_no % len(addrs)]
-                self._slave_no += 1
-                if nodelay:
-                    connector.connect()
-                else:
-                    self.retry(connector)
-            else:
-                log.msg("txredisapi: No slaves discovered, falling back to master")
-                self.try_to_connect(connector, force_master=True, nodelay=True)
-
-        if self.is_master or force_master:
-            self.sentinel_manager.discover_master(self.service_name) \
-                .addCallbacks(on_master_addr, on_discovery_err)
-        else:
-            self.sentinel_manager.discover_slaves(self.service_name) \
-                .addCallback(on_slave_addrs)
-
-
-class Sentinel(object):
-
-    discovery_timeout = 10
-
-    def __init__(self, sentinel_addresses, min_other_sentinels=0, **connection_kwargs):
-        self.sentinels = [
-            lazyConnection(host, port, **connection_kwargs)
-            for host, port in sentinel_addresses
-        ]
-
-        self.min_other_sentinels = min_other_sentinels
-
-    def disconnect(self):
-        return defer.gatherResults([sentinel.disconnect() for sentinel in self.sentinels],
-                                   consumeErrors = True)
-
-    def check_master_state(self, state):
-        if not state["is_master"] or state["is_sdown"] or state["is_odown"]:
-            return False
-
-        if int(state["num-other-sentinels"]) < self.min_other_sentinels:
-            return False
-
-        return True
-
-    def discover_master(self, service_name):
-        result = defer.Deferred()
-
-        def on_response(response):
-            if result.called:
-                return
-
-            state = response.get(service_name)
-            if state and self.check_master_state(state):
-                result.callback((state["ip"], int(state["port"])))
-                timeout_call.cancel()
-
-        def on_timeout():
-            if not result.called:
-                result.errback(MasterNotFoundError(
-                    "No master found for {0}".format(service_name)))
-
-        # Ignoring errors
-        for sentinel in self.sentinels:
-            sentinel.sentinel_masters().addCallbacks(on_response, lambda _: None)
-
-        timeout_call = reactor.callLater(self.discovery_timeout, on_timeout)
-
-        return result
-
-    @staticmethod
-    def filter_slaves(slaves):
-        """Remove slaves that are in ODOWN or SDOWN state"""
-        return [
-            (slave["ip"], int(slave["port"]))
-            for slave in slaves
-            if not slave["is_odown"] and not slave["is_sdown"]
-        ]
-
-    def discover_slaves(self, service_name):
-        result = defer.Deferred()
-
-        def on_response(response):
-            if result.called:
-                return
-
-            slaves = self.filter_slaves(response)
-            if slaves:
-                result.callback(slaves)
-                timeout_call.cancel()
-
-        def on_timeout():
-            if not result.called:
-                result.callback([])
-
-        for sentinel in self.sentinels:
-            sentinel.sentinel_slaves(service_name).addCallbacks(on_response, lambda _: None)
-
-        timeout_call = reactor.callLater(self.discovery_timeout, on_timeout)
-
-        return result
-
-    @staticmethod
-    def _connect_factory_and_return_handler(factory, poolsize):
-        for _ in range(poolsize):
-            # host and port will be rewritten by try_to_connect
-            connector = Connector("0.0.0.0", None, factory, factory.maxDelay, None, reactor)
-            factory.try_to_connect(connector, nodelay=True)
-        return factory.handler
-
-    def master_for(self, service_name, factory_class=SentinelConnectionFactory,
-                   dbid=None, poolsize=1, **connection_kwargs):
-        factory = factory_class(sentinel_manager=self, service_name=service_name,
-                                is_master=True, uuid=None, dbid=dbid,
-                                poolsize=poolsize, **connection_kwargs)
-        return self._connect_factory_and_return_handler(factory, poolsize)
-
-    def slave_for(self, service_name, factory_class=SentinelConnectionFactory,
-                  dbid=None, poolsize=1, **connection_kwargs):
-        factory = factory_class(sentinel_manager=self, service_name=service_name,
-                                is_master=False, uuid=None, dbid=dbid,
-                                poolsize=poolsize, **connection_kwargs)
-        return self._connect_factory_and_return_handler(factory, poolsize)
-
-
 __all__ = [
     Connection, lazyConnection,
     ConnectionPool, lazyConnectionPool,
-    ShardedConnection, lazyShardedConnection,
-    ShardedConnectionPool, lazyShardedConnectionPool,
-    UnixConnection, lazyUnixConnection,
-    UnixConnectionPool, lazyUnixConnectionPool,
-    ShardedUnixConnection, lazyShardedUnixConnection,
-    ShardedUnixConnectionPool, lazyShardedUnixConnectionPool,
-    Sentinel, MasterNotFoundError
 ]
 
 __author__ = "Alexandre Fiori"
