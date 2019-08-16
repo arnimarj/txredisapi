@@ -1415,6 +1415,15 @@ class BaseRedisProtocol(LineReceiver, policies.TimeoutMixin):
         args = self._build_scan_args(cursor, pattern, count)
         return self.execute_command("HSCAN", key, *args)
 
+    def cluster_slots(self):
+        return self.execute_command('CLUSTER', 'SLOTS')
+
+    def cluster_nodes(self):
+        return self.execute_command('CLUSTER', 'NODES')
+
+    def cluster_info(self):
+        return self.execute_command('CLUSTER', 'INFO')
+
     # Sorting
     def sort(self, key, start=None, end=None, by=None, get=None,
              desc=None, alpha=False, store=None):
