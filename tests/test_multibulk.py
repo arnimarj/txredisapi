@@ -32,8 +32,7 @@ class LargeMultiBulk(unittest.TestCase):
     @defer.inlineCallbacks
     def setUp(self):
         self.db = yield redis.Connection(
-            REDIS_HOST, REDIS_PORT, reconnect=False,
-            charset=None)
+            REDIS_HOST, REDIS_PORT, reconnect=False)
 
     @defer.inlineCallbacks
     def tearDown(self):

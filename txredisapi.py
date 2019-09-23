@@ -251,9 +251,7 @@ class BaseRedisProtocol(LineReceiver, policies.TimeoutMixin):
         self.transport.loseConnection()
         self.connectionLost('timeout')
 
-    def __init__(self, charset="utf-8", errors="strict", replyTimeout=None, logger=None):
-        self.charset = charset
-        self.errors = errors
+    def __init__(self, replyTimeout=None, logger=None):
         self.replyTimeout = replyTimeout
         self.logger = logger
 
@@ -434,31 +432,10 @@ class BaseRedisProtocol(LineReceiver, policies.TimeoutMixin):
         if isinstance(data, list):
             return [self.tryConvertData(x) for x in data]
         el = None
-        if self.factory.convertNumbers:
-            if data:
-                num_data = data
-                try:
-                    if isinstance(data, six.binary_type):
-                        num_data = data.decode()
-                except UnicodeError:
-                    pass
-                else:
-                    if num_data[0] in _NUM_FIRST_CHARS:  # Most likely a number
-                        try:
-                            el = int(num_data) if num_data.find('.') == -1 \
-                                else float(num_data)
-                        except ValueError:
-                            pass
 
         if el is None:
             el = data
-            if self.charset is not None:
-                try:
-                    el = data.decode(self.charset)
-                except UnicodeDecodeError:
-                    pass
-                except AttributeError:
-                    el = data
+
         return el
 
     def handleMultiBulkElement(self, element):
@@ -495,27 +472,14 @@ class BaseRedisProtocol(LineReceiver, policies.TimeoutMixin):
         return r
 
     def _encode_value(self, arg):
-        if isinstance(arg, six.binary_type):
-            return arg
-        elif isinstance(arg, six.text_type):
-            if self.charset is None:
-                try:
-                    return arg.encode()
-                except UnicodeError:
-                    pass
-                raise InvalidData("Encoding charset was not specified")
-            try:
-                return arg.encode(self.charset, self.errors)
-            except UnicodeEncodeError as e:
-                raise InvalidData(
-                    "Error encoding unicode value '%s': %s" %
-                    (repr(arg), e))
-        elif isinstance(arg, float):
-            return format(arg, "f").encode()
-        elif isinstance(arg, bytearray):
+        if not isinstance(arg, (bytes, bytearray)):
+            raise InvalidData(f'only bytes/bytearrays supported, not {type(arg)}')
+
+        if isinstance(arg, bytearray):
             return bytes(arg)
         else:
-            return str(arg).format().encode()
+            return arg
+
 
     def _build_command(self, *args, **kwargs):
         # Build the redis command.
@@ -1762,8 +1726,8 @@ class RedisFactory(protocol.ReconnectingClientFactory):
     protocol = RedisProtocol
 
     def __init__(self, uuid, dbid, poolsize, isLazy=False,
-                 handler=ConnectionHandler, charset="utf-8", password=None,
-                 replyTimeout=None, convertNumbers=True, logger=None):
+                 handler=ConnectionHandler, password=None,
+                 replyTimeout=None, logger=None):
         if not isinstance(poolsize, int):
             raise ValueError("Redis poolsize must be an integer, not %s" %
                              repr(poolsize))
@@ -1776,10 +1740,8 @@ class RedisFactory(protocol.ReconnectingClientFactory):
         self.dbid = dbid
         self.poolsize = poolsize
         self.isLazy = isLazy
-        self.charset = charset
         self.password = password
         self.replyTimeout = replyTimeout
-        self.convertNumbers = convertNumbers
         self.logger = logger
 
         self.idx = 0
@@ -1812,10 +1774,7 @@ class RedisFactory(protocol.ReconnectingClientFactory):
         }
 
     def buildProtocol(self, addr):
-        if hasattr(self, 'charset'):
-            p = self.protocol(self.charset, replyTimeout = self.replyTimeout, logger = self.logger)
-        else:
-            p = self.protocol(replyTimeout = self.replyTimeout, logger = self.logger)
+        p = self.protocol(replyTimeout = self.replyTimeout, logger = self.logger)
         p.factory = self
         return p
 
@@ -1972,11 +1931,11 @@ class RedisFactory(protocol.ReconnectingClientFactory):
 
 
 def makeConnection(host, port, dbid, poolsize, reconnect, isLazy,
-                   charset, password, connectTimeout, replyTimeout,
-                   convertNumbers, logger):
+                   password, connectTimeout, replyTimeout,
+                   logger):
     uuid = "%s:%d" % (host, port)
     factory = RedisFactory(uuid, dbid, poolsize, isLazy, ConnectionHandler,
-                           charset, password, replyTimeout, convertNumbers, logger)
+                           password, replyTimeout, logger)
     factory.continueTrying = reconnect
 
     for x in range(poolsize):
@@ -1989,37 +1948,37 @@ def makeConnection(host, port, dbid, poolsize, reconnect, isLazy,
 
 
 def Connection(host="localhost", port=6379, dbid=None, reconnect=True,
-               charset="utf-8", password=None,
-               connectTimeout=None, replyTimeout=None, convertNumbers=True, logger=None):
+               password=None,
+               connectTimeout=None, replyTimeout=None, logger=None):
     return makeConnection(host, port, dbid, 1, reconnect, False,
-                          charset, password, connectTimeout, replyTimeout,
-                          convertNumbers, logger)
+                          password, connectTimeout, replyTimeout,
+                          logger)
 
 
 def lazyConnection(host="localhost", port=6379, dbid=None, reconnect=True,
-                   charset="utf-8", password=None,
-                   connectTimeout=None, replyTimeout=None, convertNumbers=True, logger=None):
+                   password=None,
+                   connectTimeout=None, replyTimeout=None, logger=None):
     return makeConnection(host, port, dbid, 1, reconnect, True,
-                          charset, password, connectTimeout, replyTimeout,
-                          convertNumbers, logger)
+                          password, connectTimeout, replyTimeout,
+                          logger)
 
 
 def ConnectionPool(host="localhost", port=6379, dbid=None,
-                   poolsize=10, reconnect=True, charset="utf-8", password=None,
+                   poolsize=10, reconnect=True, password=None,
                    connectTimeout=None, replyTimeout=None,
-                   convertNumbers=True, logger=None):
+                   logger=None):
     return makeConnection(host, port, dbid, poolsize, reconnect, False,
-                          charset, password, connectTimeout, replyTimeout,
-                          convertNumbers, logger)
+                          password, connectTimeout, replyTimeout,
+                          logger)
 
 
 def lazyConnectionPool(host="localhost", port=6379, dbid=None,
-                       poolsize=10, reconnect=True, charset="utf-8",
+                       poolsize=10, reconnect=True,
                        password=None, connectTimeout=None, replyTimeout=None,
-                       convertNumbers=True, logger=None):
+                       logger=None):
     return makeConnection(host, port, dbid, poolsize, reconnect, True,
-                          charset, password, connectTimeout, replyTimeout,
-                          convertNumbers, logger)
+                          password, connectTimeout, replyTimeout,
+                          logger)
 
 
 __all__ = [

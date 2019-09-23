@@ -30,24 +30,12 @@ class TestConnectionCharset(unittest.TestCase):
 
     @defer.inlineCallbacks
     def test_charset_None(self):
-        db = yield redis.Connection(REDIS_HOST, REDIS_PORT, charset=None)
+        db = yield redis.Connection(REDIS_HOST, REDIS_PORT)
 
         yield db.set(self.TEST_KEY, self.TEST_VALUE_BINARY)
         result = yield db.get(self.TEST_KEY)
         self.assertTrue(type(result) == six.binary_type)
         self.assertEqual(result, self.TEST_VALUE_BINARY)
-
-        yield db.delete(self.TEST_KEY)
-        yield db.disconnect()
-
-    @defer.inlineCallbacks
-    def test_charset_default(self):
-        db = yield redis.Connection(REDIS_HOST, REDIS_PORT)
-
-        yield db.set(self.TEST_KEY, self.TEST_VALUE_UNICODE)
-        result = yield db.get(self.TEST_KEY)
-        self.assertEqual(result, self.TEST_VALUE_UNICODE)
-        self.assertTrue(type(result) == six.text_type)
 
         yield db.delete(self.TEST_KEY)
         yield db.disconnect()
